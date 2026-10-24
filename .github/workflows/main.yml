@@ -1,50 +1,99 @@
 name: 'Update schedule'
 
-# ⚠️注意：请不要在 fork 的仓库中添加 `on: schedule` 定时任务（cron）。
-# Forks 可能被大量复制并触发定时执行，当前 GitHub Actions 资源使用已接近上限，
-# 大量 fork 的定时任务可能导致工作流被禁用。若需要定时执行，请使用其它部署方式。
-#
-# ⚠️NOTICE: Do NOT add `on: schedule` cron triggers in forked repositories.
-# Forks may multiply scheduled runs and GitHub Actions resource usage is near limits.
-# Many scheduled workflows from forks can cause workflows to be disabled.
-# If scheduled execution is required, use other deployment methods.
+# 本仓库为 Guovin/iptv-api 的独立部署（非 fork），由 Proma 定时任务每天 22:00 触发。
+# 与原版差异：FFmpeg 安装步骤增加了镜像切换、超时保护与静态包兜底，
+# 避免 azure.archive.ubuntu.com 限速丢包导致整轮构建卡死超时。
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
+concurrency:
+  group: iptv-update
+  cancel-in-progress: false
+
 jobs:
   push:
     runs-on: ${{ matrix.operating-system }}
+    timeout-minutes: 40
     strategy:
       matrix:
         operating-system: [ 'ubuntu-latest' ]
     steps:
       - name: Set branch name
         id: vars
-        run: echo "BRANCH_NAME=${{ github.repository_owner == 'Guovin' && 'gd' || 'master' }}" >> $GITHUB_ENV
-      - uses: actions/checkout@v6
+        run: echo "BRANCH_NAME=master" >> $GITHUB_ENV
+
+      - uses: actions/checkout@v4
         with:
           ref: ${{ env.BRANCH_NAME }}
+          fetch-depth: 1
+
       - name: Run with setup-python 3.14
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: '3.14'
           update-environment: true
           cache: 'pipenv'
+
       - name: Install FFmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+        run: |
+          set -uo pipefail
+          if command -v ffmpeg >/dev/null 2>&1; then
+            echo "ffmpeg already available: $(ffmpeg -version | head -1)"
+            exit 0
+          fi
+
+          echo "::group::Switch apt mirror away from azure.archive.ubuntu.com"
+          sudo sed -i \
+            -e 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' \
+            -e 's|ports.azure.archive.ubuntu.com|ports.ubuntu.com|g' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null || true
+          grep -rhE '^URIs:|^deb ' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null | head -10 || true
+          echo "::endgroup::"
+
+          echo "::group::apt-get install ffmpeg (10 min cap)"
+          if timeout 600 sudo apt-get update \
+               -o Acquire::Retries=3 \
+               -o Acquire::http::Timeout=20 \
+               -o Acquire::https::Timeout=20; then
+            if timeout 600 sudo apt-get install -y --no-install-recommends ffmpeg; then
+              echo "ffmpeg installed from apt: $(ffmpeg -version | head -1)"
+              echo "::endgroup::"
+              exit 0
+            fi
+          fi
+          echo "::endgroup::"
+
+          echo "::warning::apt install failed, falling back to static ffmpeg build"
+          curl -fsSL --retry 3 --retry-delay 5 --max-time 300 \
+            -o /tmp/ffmpeg.tar.xz \
+            https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
+          mkdir -p /tmp/ffmpeg-static
+          tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-static --strip-components=1
+          sudo install -m 0755 /tmp/ffmpeg-static/ffmpeg /usr/local/bin/ffmpeg
+          sudo install -m 0755 /tmp/ffmpeg-static/ffprobe /usr/local/bin/ffprobe
+          ffmpeg -version | head -1
+
       - name: Install pipenv
         run: pip3 install --user pipenv
+
       - name: Install dependecies
         run: pipenv --python 3.14 && pipenv install --deploy
+
       - name: Update
         run: pipenv run dev
+
       - name: Commit and push if changed
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
-          git add .
+          git add -A
           if ! git diff --staged --quiet; then
             git commit -m "Github Action Auto Updated"
-            git push --force
+            git push origin HEAD:${BRANCH_NAME}
+          else
+            echo "No changes to commit"
           fi
